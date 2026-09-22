@@ -16,6 +16,7 @@ docker compose up --build
 
 依赖安装与建表均在启动时自动完成：Compose 启动 Postgres 16 与 API 两个容器，
 API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` / `reveals`）。
+两个容器均带 healthcheck，`docker compose ps` 中状态变为 `healthy` 即就绪。
 
 ## 承诺哈希方案
 
@@ -49,6 +50,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events` | 创建事件（commit_deadline 须在未来，reveal_deadline 须更晚） |
 | GET | `/events` | 事件列表（含状态与计数） |
 | GET | `/events/{id}` | 事件详情 |
+| POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
@@ -88,6 +90,53 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals \
 curl -s http://localhost:8000/events/<EVENT_ID>/timeline
 ```
 
+## 事件窗口冲突分析（`POST /events/conflicts`）
+
+把每个事件按**服务端 UTC** 视为两段**半开**时间区间，用 sweep-line 计算任意时刻
+有哪些事件同时处于**同一阶段**（同为 `commit` 或同为 `reveal`，跨阶段不算冲突）：
+
+```
+commit: [created_at, commit_deadline)
+reveal: [commit_deadline, reveal_deadline)
+```
+
+半开边界语义：到达 `commit_deadline` 的瞬间旧事件已离开 commit 阶段、新事件可恰好
+进入——首尾相接（一个区间的右端点等于另一个的左端点）**不产生**冲突。返回的冲突片段
+按 `start`、`end`、`phase` 排序，片段内 `event_ids` 升序；无冲突（或请求为空）时
+稳定返回空列表。
+
+```bash
+curl -s -X POST http://localhost:8000/events/conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"]}'
+```
+
+```json
+{
+  "generated_at": "2030-06-01T00:00:00Z",
+  "phases": ["commit", "reveal"],
+  "count": 2,
+  "segments": [
+    {
+      "start": "2030-01-01T01:00:00Z",
+      "end": "2030-01-01T02:00:00Z",
+      "phase": "commit",
+      "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"]
+    },
+    {
+      "start": "2030-01-02T01:00:00Z",
+      "end": "2030-01-02T02:00:00Z",
+      "phase": "reveal",
+      "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"]
+    }
+  ]
+}
+```
+
+空结果同样稳定：`POST /events/conflicts -d '{"event_ids": []}'`（或省略字段）返回
+`{"generated_at": "...", "phases": ["commit", "reveal"], "count": 0, "segments": []}`。
+请求中的重复 ID 自动去重；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；非 UUID 返回 422。
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -96,7 +145,7 @@ curl -s http://localhost:8000/events/<EVENT_ID>/timeline
 | HTTP | code | 场景 |
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
-| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
 | 409 | `DUPLICATE_COMMITMENT` | 同一事件内重复的承诺哈希 |
 | 409 | `REVEAL_PHASE_NOT_STARTED` | 提前揭示（未到 commit_deadline） |
@@ -121,11 +170,13 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 ```
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
+  conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
   models.py     # SQLAlchemy 模型（events / commitments / reveals）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
-tests/test_api.py
+tests/test_api.py        # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_conflicts.py  # 冲突分析：sweep-line 边界、排序与 API 用例
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

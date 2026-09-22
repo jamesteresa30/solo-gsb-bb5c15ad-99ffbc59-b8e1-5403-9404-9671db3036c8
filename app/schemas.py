@@ -80,6 +80,27 @@ class TimelineOut(BaseModel):
     entries: list[TimelineEntry]
 
 
+class ConflictRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        default_factory=list,
+        description="待分析的事件 ID 列表（重复 ID 自动去重，空列表返回空结果）",
+    )
+
+
+class ConflictSegmentOut(BaseModel):
+    start: datetime = Field(description="片段起点（含，UTC）")
+    end: datetime = Field(description="片段终点（不含，UTC，半开边界）")
+    phase: str  # commit | reveal
+    event_ids: list[UUID] = Field(description="该时段同时处于同一阶段的事件 ID（已排序）")
+
+
+class ConflictsOut(BaseModel):
+    generated_at: datetime
+    phases: list[str]
+    count: int = Field(description="冲突片段数量")
+    segments: list[ConflictSegmentOut]
+
+
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str

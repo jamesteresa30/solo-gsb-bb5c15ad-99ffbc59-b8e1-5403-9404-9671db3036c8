@@ -16,12 +16,15 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, Event, Reveal
 from .schemas import (
     CommitmentCreate,
     CommitmentOut,
+    ConflictRequest,
+    ConflictsOut,
     EventCreate,
     EventOut,
     HashOut,
@@ -180,6 +183,59 @@ def list_events(db: Session = Depends(get_db)):
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: UUID, db: Session = Depends(get_db)):
     return event_out(get_event_or_404(db, event_id), db, now_utc())
+
+
+# --------------------------------------------------------------------------- #
+# 事件窗口冲突分析
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/conflicts", response_model=ConflictsOut)
+def analyze_event_conflicts(payload: ConflictRequest, db: Session = Depends(get_db)):
+    """用 sweep-line 计算多个事件的阶段窗口冲突。
+
+    每个事件按服务端 UTC 视为两段半开区间：
+      commit: [created_at, commit_deadline)
+      reveal: [commit_deadline, reveal_deadline)
+
+    返回任意时刻同时处于**同一**阶段（commit 或 reveal）的事件集合所
+    覆盖的时间片段；片段按起止时间与阶段排序。请求中的重复 ID 去重；
+    任何 ID 不存在均返回 404；空列表稳定返回空片段集。
+    """
+    now = now_utc()
+    # 保序去重：同一事件只参与一次分析
+    event_ids = list(dict.fromkeys(payload.event_ids))
+
+    events_by_id: dict[UUID, Event] = {}
+    if event_ids:
+        events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+        events_by_id = {e.id: e for e in events}
+    missing = next((eid for eid in event_ids if eid not in events_by_id), None)
+    if missing is not None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {missing} 不存在")
+
+    windows: list[PhaseWindow] = []
+    for event in (events_by_id[eid] for eid in event_ids):
+        created = as_utc(event.created_at)
+        commit_dl = as_utc(event.commit_deadline)
+        reveal_dl = as_utc(event.reveal_deadline)
+        windows.append(PhaseWindow(event.id, COMMIT, created, commit_dl))
+        windows.append(PhaseWindow(event.id, REVEAL, commit_dl, reveal_dl))
+
+    segments = sweep_conflicts(windows)
+    return ConflictsOut(
+        generated_at=now,
+        phases=[COMMIT, REVEAL],
+        count=len(segments),
+        segments=[
+            {
+                "start": s.start,
+                "end": s.end,
+                "phase": s.phase,
+                "event_ids": list(s.event_ids),
+            }
+            for s in segments
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #
