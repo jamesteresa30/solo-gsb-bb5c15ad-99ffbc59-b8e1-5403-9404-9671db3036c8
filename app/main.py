@@ -17,11 +17,15 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
+from .conflicts import PhaseWindow, event_windows, sweep_conflicts
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, Event, Reveal
 from .schemas import (
     CommitmentCreate,
     CommitmentOut,
+    ConflictSegmentOut,
+    ConflictsOut,
+    ConflictsRequest,
     EventCreate,
     EventOut,
     HashOut,
@@ -180,6 +184,52 @@ def list_events(db: Session = Depends(get_db)):
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: UUID, db: Session = Depends(get_db)):
     return event_out(get_event_or_404(db, event_id), db, now_utc())
+
+
+# --------------------------------------------------------------------------- #
+# 冲突分析
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/conflicts", response_model=ConflictsOut)
+def analyze_event_conflicts(payload: ConflictsRequest, db: Session = Depends(get_db)):
+    """按服务端 UTC 分析一组事件的 commit/reveal 窗口重叠（sweep-line）。
+
+    每个事件视为两个半开区间 [created_at, commit_deadline) 与
+    [commit_deadline, reveal_deadline)；返回任意时刻同时处于同一阶段的事件
+    集合所构成的极大冲突片段，按 (start, end, phase) 排序。无冲突时稳定返回
+    空列表。
+    """
+    event_ids = list(dict.fromkeys(payload.event_ids))  # 去重并保持请求顺序
+    events = db.query(Event).filter(Event.id.in_(event_ids)).all() if event_ids else []
+    by_id = {e.id: e for e in events}
+    missing = [str(eid) for eid in event_ids if eid not in by_id]
+    if missing:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件不存在: {', '.join(missing)}")
+
+    windows: list[PhaseWindow] = []
+    for event in events:
+        windows.extend(
+            event_windows(
+                event.id,
+                as_utc(event.created_at),
+                as_utc(event.commit_deadline),
+                as_utc(event.reveal_deadline),
+            )
+        )
+    segments = sweep_conflicts(windows)
+    return ConflictsOut(
+        generated_at=now_utc(),
+        event_count=len(events),
+        conflicts=[
+            ConflictSegmentOut(
+                phase=s.phase,
+                start=s.start,
+                end=s.end,
+                event_ids=list(s.event_ids),
+            )
+            for s in segments
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #

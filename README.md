@@ -49,6 +49,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events` | 创建事件（commit_deadline 须在未来，reveal_deadline 须更晚） |
 | GET | `/events` | 事件列表（含状态与计数） |
 | GET | `/events/{id}` | 事件详情 |
+| POST | `/events/conflicts` | 事件窗口冲突分析（commit/reveal 半开区间的 sweep-line 重叠检测） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
 | POST | `/events/{id}/reveals` | 揭示：提交原文 + 盐，服务端重算校验 |
@@ -88,6 +89,44 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals \
 curl -s http://localhost:8000/events/<EVENT_ID>/timeline
 ```
 
+## 事件窗口冲突分析
+
+`POST /events/conflicts` 接收事件 ID 列表，把每个事件按服务端 UTC 拆成两个
+**半开区间**（commit：`[created_at, commit_deadline)`，reveal：
+`[commit_deadline, reveal_deadline)`），用 sweep-line 找出任意时刻同时处于
+同一阶段的事件集合，返回极大的冲突片段：
+
+```bash
+curl -s -X POST http://localhost:8000/events/conflicts \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_3>"]}'
+```
+
+```json
+{
+  "generated_at": "2026-09-22T08:00:00Z",
+  "event_count": 3,
+  "conflicts": [
+    {
+      "phase": "commit",
+      "start": "2026-09-22T08:00:01.123456Z",
+      "end": "2030-01-01T00:00:00Z",
+      "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>"]
+    },
+    {
+      "phase": "reveal",
+      "start": "2030-01-02T00:00:00Z",
+      "end": "2030-01-03T00:00:00Z",
+      "event_ids": ["<EVENT_ID_1>", "<EVENT_ID_3>"]
+    }
+  ]
+}
+```
+
+- 片段按 `(start, end, phase)` 排序，片段内事件 ID 按字典序排列，输出稳定；
+- 半开边界：仅在端点处相接的窗口**不构成**冲突；无冲突时 `conflicts` 稳定为 `[]`；
+- 重复 ID 自动去重；列表中含不存在的 ID 时返回 404 `EVENT_NOT_FOUND`。
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -121,11 +160,14 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 ```
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
+  conflicts.py  # 事件窗口冲突分析（sweep-line）
   models.py     # SQLAlchemy 模型（events / commitments / reveals）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
-tests/test_api.py
+tests/
+  test_api.py        # 业务规则冒烟测试（SQLite + 模拟时钟）
+  test_conflicts.py  # sweep-line 冲突分析单元测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

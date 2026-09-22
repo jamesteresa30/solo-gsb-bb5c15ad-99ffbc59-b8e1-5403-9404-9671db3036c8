@@ -180,3 +180,75 @@ def test_full_lifecycle():
 def test_health():
     with client:
         assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_event_conflicts():
+    with client:
+        clock.t = T0  # 重置模拟时钟，保证新事件的 commit_deadline 在未来
+
+        def make_event(title, commit_dl, reveal_dl):
+            r = client.post("/events", json={
+                "title": title,
+                "commit_deadline": iso(commit_dl),
+                "reveal_deadline": iso(reveal_dl),
+            })
+            assert r.status_code == 201, r.text
+            return r.json()
+
+        t = lambda h: T0 + timedelta(hours=h)
+        # 响应中 UTC 时间序列化为 "Z" 后缀（pydantic 行为），期望串对齐该格式
+        iso_z = lambda dt: iso(dt).replace("+00:00", "Z")
+        a = make_event("冲突分析-A", t(1), t(3))
+        b = make_event("冲突分析-B", t(2), t(4))
+        c = make_event("冲突分析-C", t(5), t(6))
+
+        # commit 窗口起点为真实时钟的创建时刻，严格递增且早于 T0
+        ca, cb, cc = a["created_at"], b["created_at"], c["created_at"]
+        assert ca < cb < cc < iso_z(t(1))
+
+        # --- 三事件冲突：sweep-line 极大片段 ------------------------------
+        r = client.post("/events/conflicts",
+                        json={"event_ids": [a["id"], b["id"], c["id"]]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["event_count"] == 3
+        # commit 窗口: A [ca,t1) B [cb,t2) C [cc,t5)，ca<cb<cc<t1<t2<t5
+        # reveal 窗口: A [t1,t3) B [t2,t4) C [t5,t6)
+        assert body["conflicts"] == [
+            {"phase": "commit", "start": cb, "end": cc,
+             "event_ids": sorted([a["id"], b["id"]])},
+            {"phase": "commit", "start": cc, "end": iso_z(t(1)),
+             "event_ids": sorted([a["id"], b["id"], c["id"]])},
+            {"phase": "commit", "start": iso_z(t(1)), "end": iso_z(t(2)),
+             "event_ids": sorted([b["id"], c["id"]])},
+            {"phase": "reveal", "start": iso_z(t(2)), "end": iso_z(t(3)),
+             "event_ids": sorted([a["id"], b["id"]])},
+        ]
+        # 片段按 (start, end) 排序
+        keys = [(s["start"], s["end"]) for s in body["conflicts"]]
+        assert keys == sorted(keys)
+
+        # --- 半开边界：reveal 窗口端点相接 [t1,t3) 与 [t3,t4) 不构成冲突 ---
+        e = make_event("冲突分析-E", t(3), t(4))
+        r = client.post("/events/conflicts", json={"event_ids": [a["id"], e["id"]]})
+        assert r.status_code == 200, r.text
+        reveal_conflicts = [s for s in r.json()["conflicts"] if s["phase"] == "reveal"]
+        assert reveal_conflicts == []
+
+        # --- 空列表 / 单事件 / 重复 ID：均稳定返回空冲突 -------------------
+        r = client.post("/events/conflicts", json={"event_ids": []})
+        assert r.status_code == 200, r.text
+        assert r.json()["event_count"] == 0 and r.json()["conflicts"] == []
+
+        r = client.post("/events/conflicts", json={"event_ids": [a["id"], a["id"]]})
+        assert r.status_code == 200, r.text
+        assert r.json()["event_count"] == 1 and r.json()["conflicts"] == []
+
+        # --- 未知事件 -> 404，不产生任何分析结果 ---------------------------
+        missing = "00000000-0000-0000-0000-000000000000"
+        r = client.post("/events/conflicts", json={"event_ids": [a["id"], missing]})
+        assert r.status_code == 404 and r.json()["detail"]["code"] == "EVENT_NOT_FOUND"
+
+        # --- 非法 UUID -> 422 ---------------------------------------------
+        r = client.post("/events/conflicts", json={"event_ids": ["not-a-uuid"]})
+        assert r.status_code == 422

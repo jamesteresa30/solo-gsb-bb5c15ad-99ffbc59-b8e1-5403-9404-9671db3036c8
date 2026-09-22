@@ -83,3 +83,23 @@ class TimelineOut(BaseModel):
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str
+
+
+class ConflictsRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        default_factory=list,
+        description="待分析的事件 ID 列表；重复 ID 自动去重，不存在的 ID 返回 404",
+    )
+
+
+class ConflictSegmentOut(BaseModel):
+    phase: str  # commit | reveal
+    start: datetime
+    end: datetime
+    event_ids: list[UUID]
+
+
+class ConflictsOut(BaseModel):
+    generated_at: datetime
+    event_count: int
+    conflicts: list[ConflictSegmentOut]
